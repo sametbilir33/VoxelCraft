@@ -1149,6 +1149,16 @@ int main() {
             );
 
 
+            const int playerChunkX = static_cast<int>(
+    std::floor(player.position.x / CHUNK_SIZE)
+);
+
+const int playerChunkZ = static_cast<int>(
+    std::floor(player.position.z / CHUNK_SIZE)
+);
+
+world.updateStreaming(playerChunkX, playerChunkZ);
+
             glfwPollEvents();
 
 
