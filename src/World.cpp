@@ -1,774 +1,242 @@
 #include "World.hpp"
-#include "TextureAtlas.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <random>
-#include <utility>
-#include <vector>
 
 namespace {
-
-float smoothstep(float t) {
-    return t * t * (3.0f - 2.0f * t);
+std::size_t mix(std::size_t a, std::size_t b) { return a ^ (b + 0x9e3779b9u + (a << 6) + (a >> 2)); }
+float smoothstep(float t) { return t * t * (3.0f - 2.0f * t); }
+float lerp(float a, float b, float t) { return a + (b - a) * t; }
+bool rayBox(const glm::vec3& o, const glm::vec3& d, const glm::vec3& mn, const glm::vec3& mx, float maxD, float& hit, glm::ivec3& n) {
+    float lo = 0.0f, hi = maxD; n = glm::ivec3(0);
+    for (int a = 0; a < 3; ++a) {
+        if (std::abs(d[a]) < 1e-7f) { if (o[a] < mn[a] || o[a] > mx[a]) return false; continue; }
+        float t1 = (mn[a] - o[a]) / d[a], t2 = (mx[a] - o[a]) / d[a]; int sign = -1;
+        if (t1 > t2) { std::swap(t1, t2); sign = 1; }
+        if (t1 > lo) { lo = t1; n = glm::ivec3(0); n[a] = sign; }
+        hi = std::min(hi, t2); if (lo > hi) return false;
+    }
+    hit = lo; return hi >= 0.0f && lo <= maxD;
+}
 }
 
-float lerp(float a, float b, float t) {
-    return a + (b - a) * t;
+std::size_t ChunkPositionHash::operator()(const ChunkPosition& p) const { return mix(mix(std::hash<int>{}(p.x), std::hash<int>{}(p.y)), std::hash<int>{}(p.z)); }
+std::size_t BlockPositionHash::operator()(const BlockPosition& p) const { return mix(mix(std::hash<int>{}(p.x), std::hash<int>{}(p.y)), std::hash<int>{}(p.z)); }
+
+World::World(WorldSettings worldSettings) : settings(worldSettings) { std::random_device rd; seed = (std::uint32_t(rd()) << 16) ^ rd(); std::cout << "World seed: " << seed << '\n'; generateWorld(); }
+int World::floorDiv(int v, int d) { int q = v / d, r = v % d; return q - (r < 0 ? 1 : 0); }
+int World::floorMod(int v, int d) { int r = v % d; return r < 0 ? r + d : r; }
+std::uint32_t World::hash2D(int x, int z) const { std::uint32_t h=seed; h^=std::uint32_t(x)*0x8da6b343u; h^=std::uint32_t(z)*0xd8163841u; h^=h>>13; h*=0x85ebca6bu; h^=h>>16; h*=0xc2b2ae35u; return h^(h>>16); }
+std::uint32_t World::hash3D(int x,int y,int z) const { std::uint32_t h=hash2D(x,z)^std::uint32_t(y)*0xcb1ab31fu; h^=h>>15; h*=0x2c1b3c6du; h^=h>>12; h*=0x297a2d39u; return h^(h>>15); }
+float World::random01(int x,int z) const { return float(hash2D(x,z)&0xffffffu)/float(0x1000000u); }
+float World::noise2D(float x,float z) const { int ix=int(std::floor(x)), iz=int(std::floor(z)); float fx=smoothstep(x-ix), fz=smoothstep(z-iz); auto v=[this](int a,int b){return random01(a,b)*2-1;}; return lerp(lerp(v(ix,iz),v(ix+1,iz),fx),lerp(v(ix,iz+1),v(ix+1,iz+1),fx),fz); }
+float World::noise3D(float x,float y,float z) const { int ix=int(std::floor(x)),iy=int(std::floor(y)),iz=int(std::floor(z)); float fx=smoothstep(x-ix),fy=smoothstep(y-iy),fz=smoothstep(z-iz); auto v=[this](int a,int b,int c){return float(hash3D(a,b,c)&0xffffffu)/float(0x800000u)-1;}; float x00=lerp(v(ix,iy,iz),v(ix+1,iy,iz),fx),x10=lerp(v(ix,iy+1,iz),v(ix+1,iy+1,iz),fx),x01=lerp(v(ix,iy,iz+1),v(ix+1,iy,iz+1),fx),x11=lerp(v(ix,iy+1,iz+1),v(ix+1,iy+1,iz+1),fx); return lerp(lerp(x00,x10,fy),lerp(x01,x11,fy),fz); }
+float World::oceanFactor(int x, int z) const {
+    if (!settings.oceansEnabled) return 0.0f;
+    // Very low frequency continental noise creates connected, large oceans
+    // rather than isolated one-chunk ponds.
+    const float continental = noise2D(x * 0.0018f, z * 0.0018f);
+    // Only the deepest continental lows become oceans. The low frequency is
+    // deliberately unchanged, so the fewer oceans remain large.
+    return smoothstep(std::clamp((-continental - settings.oceanThreshold) / 0.30f, 0.0f, 1.0f));
 }
 
-float distanceSquared(const glm::vec3& a, const glm::vec3& b) {
-    const glm::vec3 d = a - b;
-    return glm::dot(d, d);
+float World::terrainHeight(int x,int z) const {
+    float total=0,amp=1,freq=.015f,sum=0;
+    for(int i=0;i<5;++i){ total+=noise2D(x*freq,z*freq)*amp; sum+=amp; amp*=.5f; freq*=2; }
+    const float land = 14.0f + (total/sum)*22.0f*settings.terrainAmplitude + noise2D(x*.006f,z*.006f)*8.0f*settings.terrainAmplitude;
+    const float SEA_LEVEL = static_cast<float>(settings.seaLevel);
+    const float oceanFloor = SEA_LEVEL - 6.0f + noise2D(x*.025f, z*.025f)*2.5f;
+    return std::clamp(std::floor(lerp(land, oceanFloor, oceanFactor(x, z))), 3.0f, 55.0f);
 }
 
-// Ray ile eksenlere paralel bir AABB'nin kesişimi.
-bool rayBox(
-    const glm::vec3& origin,
-    const glm::vec3& direction,
-    const glm::vec3& boxMin,
-    const glm::vec3& boxMax,
-    float maxDistance,
-    float& hitDistance,
-    glm::ivec3& hitNormal
-) {
-    float tMin = 0.0f;
-    float tMax = maxDistance;
-    glm::ivec3 normal(0);
+bool World::isCave(int x,int y,int z,int surface) const {
+    if (!settings.cavesEnabled) return false;
+    if (y < WORLD_MIN_Y + 2 || y > surface) return false;
 
-    for (int axis = 0; axis < 3; ++axis) {
-        const float o = origin[axis];
-        const float d = direction[axis];
-        const float mn = boxMin[axis];
-        const float mx = boxMax[axis];
-
-        if (std::abs(d) < 1e-7f) {
-            if (o < mn || o > mx) {
-                return false;
+    // Rare, deterministic shafts connect some underground systems to the
+    // surface. Their 64-block grid keeps entrances sparse and readable.
+    if (y >= surface - 18) {
+        for (int gx = floorDiv(x, 64) - 1; gx <= floorDiv(x, 64) + 1; ++gx) {
+            for (int gz = floorDiv(z, 64) - 1; gz <= floorDiv(z, 64) + 1; ++gz) {
+                if (random01(gx + 503, gz - 911) > 0.12f * settings.caveDensity) continue;
+                const int ex = gx * 64 + int(random01(gx - 73, gz + 31) * 64.0f);
+                const int ez = gz * 64 + int(random01(gx + 19, gz - 47) * 64.0f);
+                if (oceanFactor(ex, ez) > 0.30f) continue;
+                const int entranceSurface = int(terrainHeight(ex, ez));
+                const int dx = x - ex, dz = z - ez;
+                if (dx * dx + dz * dz <= 4 && y >= entranceSurface - 18 && y <= entranceSurface)
+                    return true;
             }
+        }
+    }
+
+    // Two coherent low-frequency fields make connected chambers/tunnels;
+    // the old high-frequency threshold produced peppered, random holes.
+    if (y >= surface - 3) return false;
+    const float chamber = noise3D(x*.045f, y*.055f, z*.045f);
+    const float detail = noise3D(x*.090f + 31.0f, y*.095f + 17.0f, z*.090f - 11.0f);
+    return chamber > 0.46f + (1.0f - settings.caveDensity) * 0.18f && detail > -0.20f;
+}
+
+Block World::generatedBlockAt(int x,int y,int z) const {
+    if (!inWorldY(y)) return Block::Air;
+    return generatedBlockAt(x, y, z, int(terrainHeight(x, z)));
+}
+
+Block World::generatedBlockAt(int x, int y, int z, int surface) const {
+    if (!inWorldY(y)) return Block::Air;
+    const int SEA_LEVEL = settings.seaLevel;
+    if (y > surface) {
+        if (settings.oceansEnabled && y <= SEA_LEVEL) return Block::Water;
+        // No tree can extend farther than this. This fast path removes the
+        // expensive nearby-tree scan for almost all air subchunk cells.
+        if (y > surface + 8) return Block::Air;
+        // Same deterministic tree placement as the former vegetation pass,
+        // evaluated on demand so a tree never forces distant sections alive.
+        const int gridX = floorDiv(x, 12);
+        const int gridZ = floorDiv(z, 12);
+        for (int gx = gridX - 1; gx <= gridX + 1; ++gx) {
+            for (int gz = gridZ - 1; gz <= gridZ + 1; ++gz) {
+                if (random01(gx + 231, gz - 491) > 0.13f) continue;
+                const int tx = gx * 12 + int(random01(gx, gz + 91) * 12.0f);
+                const int tz = gz * 12 + int(random01(gx - 71, gz) * 12.0f);
+                const int baseSurface = int(terrainHeight(tx, tz));
+                if (settings.oceansEnabled && (baseSurface <= SEA_LEVEL + 2 || oceanFactor(tx, tz) > 0.30f)) continue;
+                const int base = baseSurface + 1;
+                const int treeHeight = 4 + int(random01(tx + 97, tz - 53) * 2.0f);
+                if (x == tx && z == tz && y >= base && y < base + treeHeight)
+                    return Block::Wood;
+                const int top = base + treeHeight - 1;
+                const int dx = std::abs(x - tx), dz = std::abs(z - tz);
+                if (dx <= 2 && dz <= 2 && y >= top - 1 && y <= top + 2 &&
+                    dx + dz <= 3 && !(y == top + 2 && dx + dz > 1))
+                    return Block::Leaves;
+            }
+        }
+        if (y == surface + 1 && random01(x + 7919, z - 1543) < .035f)
+            return Block::ShortGrass;
+        return Block::Air;
+    }
+    if (isCave(x,y,z,surface)) return Block::Air;
+    // Ocean floors and a narrow shore band are sandy.
+    if (y == surface) return (settings.oceansEnabled && (surface <= SEA_LEVEL + 2 || oceanFactor(x, z) > 0.30f))
+        ? Block::Sand : Block::Grass;
+    if (settings.oceansEnabled && surface <= SEA_LEVEL + 2 && y >= surface - 4) return Block::Sand;
+    return y >= surface-3 ? Block::Dirt : Block::Stone;
+}
+Chunk& World::ensureChunk(int cx,int cy,int cz) {
+    ChunkPosition p{cx,cy,cz}; auto it=chunks.find(p); if(it != chunks.end()) return it->second;
+    auto [created, ok] = chunks.try_emplace(p,cx,cy,cz); generateChunkTerrain(created->second);
+    for (int dx=-1;dx<=1;++dx) for(int dy=-1;dy<=1;++dy) for(int dz=-1;dz<=1;++dz) if(std::abs(dx)+std::abs(dy)+std::abs(dz)==1) { auto n=chunks.find({cx+dx,cy+dy,cz+dz}); if(n!=chunks.end()) n->second.modified=true; }
+    return created->second;
+}
+void World::generateChunkTerrain(Chunk& c) {
+    int ox=c.chunkX*CHUNK_SIZE, oy=c.chunkY*SUBCHUNK_HEIGHT, oz=c.chunkZ*CHUNK_SIZE;
+    // Height is constant for a vertical column. Calculating it once instead
+    // of once per block removes thousands of octave-noise evaluations per
+    // generated subchunk.
+    for(int x=0;x<CHUNK_SIZE;++x) for(int z=0;z<CHUNK_SIZE;++z) {
+        const int wx=ox+x, wz=oz+z;
+        const int surface = int(terrainHeight(wx, wz));
+        for(int y=0;y<SUBCHUNK_HEIGHT;++y) {
+            const int wy=oy+y;
+            const Block block=generatedBlockAt(wx, wy, wz, surface);
+            auto edit=blockEdits.find({wx,wy,wz});
+            c.blocks[x][y][z]=edit==blockEdits.end()?block:edit->second;
+        }
+    }
+    c.modified=true;
+}
+Block World::getBlock(int x,int y,int z) const {
+    if(!inWorldY(y)) return Block::Air; auto edit=blockEdits.find({x,y,z}); if(edit!=blockEdits.end()) return edit->second;
+    int cx=floorDiv(x,CHUNK_SIZE),cy=floorDiv(y,SUBCHUNK_HEIGHT),cz=floorDiv(z,CHUNK_SIZE); auto it=chunks.find({cx,cy,cz});
+    if(it==chunks.end()) return generatedBlockAt(x,y,z);
+    return it->second.blocks[floorMod(x,CHUNK_SIZE)][floorMod(y,SUBCHUNK_HEIGHT)][floorMod(z,CHUNK_SIZE)];
+}
+void World::markChunkAndNeighborsModified(int x,int y,int z) { int cx=floorDiv(x,16),cy=floorDiv(y,16),cz=floorDiv(z,16); for(int i=0;i<7;++i){ static const int o[7][3]={{0,0,0},{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}}; auto it=chunks.find({cx+o[i][0],cy+o[i][1],cz+o[i][2]}); if(it!=chunks.end()) it->second.modified=true; } }
+bool World::setBlock(int x, int y, int z, Block block) {
+    if (!inWorldY(y) || getBlock(x, y, z) == block) {
+        return false;
+    }
+
+    blockEdits[{x, y, z}] = block;
+    Chunk& chunk = ensureChunk(
+        floorDiv(x, CHUNK_SIZE),
+        floorDiv(y, SUBCHUNK_HEIGHT),
+        floorDiv(z, CHUNK_SIZE)
+    );
+    chunk.blocks[floorMod(x, CHUNK_SIZE)]
+                [floorMod(y, SUBCHUNK_HEIGHT)]
+                [floorMod(z, CHUNK_SIZE)] = block;
+
+    // Only this section and its six face-neighbours can gain/lose a face.
+    markChunkAndNeighborsModified(x, y, z);
+    return true;
+}
+void World::generateWorld() { updateStreaming(3, 3, 32.0f); }
+void World::updateStreaming(int ccx,int ccz,float py) {
+    int playerSection=floorDiv(int(std::floor(py)),SUBCHUNK_HEIGHT);
+    for(auto it=chunks.begin();it!=chunks.end();) { const auto&p=it->first; if(std::abs(p.x-ccx)>LOAD_RADIUS || std::abs(p.z-ccz)>LOAD_RADIUS || (std::abs(p.y-playerSection)>2 && p.y!=floorDiv(int(terrainHeight(p.x*16+8,p.z*16+8)),16))) it=chunks.erase(it); else ++it; }
+    // Surface and player-adjacent sections are the only sections materialized. At most four each frame avoids stalls.
+    int made=0;
+    // Center-first shells make the spawn/player column available before the
+    // outer edge of the retained 7x7 area.
+    for (int radius = 0; radius <= LOAD_RADIUS && made < 4; ++radius) {
+        for (int dx = -radius; dx <= radius && made < 4; ++dx) {
+            for (int dz = -radius; dz <= radius && made < 4; ++dz) {
+                if (std::max(std::abs(dx), std::abs(dz)) != radius) continue;
+                const int x = ccx + dx, z = ccz + dz;
+                const int surfaceSection = floorDiv(int(terrainHeight(x * 16 + 8, z * 16 + 8)), 16);
+                for (int sy : {surfaceSection, playerSection, playerSection - 1, playerSection + 1}) {
+                    if (sy * 16 < WORLD_MIN_Y || sy * 16 > WORLD_MAX_Y || chunks.contains({x, sy, z})) continue;
+                    ensureChunk(x, sy, z);
+                    if (++made >= 4) break;
+                }
+            }
+        }
+    }
+}
+bool World::isVisible(const Chunk& c, const glm::mat4& clip) const {
+    // GLM indexes matrices as [column][row].  Frustum extraction, however,
+    // is defined in terms of rows of projection * view.  Adding clip[3] and
+    // clip[0] directly mixed columns and produced camera-angle-dependent,
+    // invalid planes.
+    const glm::vec4 row0(clip[0][0], clip[1][0], clip[2][0], clip[3][0]);
+    const glm::vec4 row1(clip[0][1], clip[1][1], clip[2][1], clip[3][1]);
+    const glm::vec4 row2(clip[0][2], clip[1][2], clip[2][2], clip[3][2]);
+    const glm::vec4 row3(clip[0][3], clip[1][3], clip[2][3], clip[3][3]);
+    glm::vec4 planes[6] = {
+        row3 + row0, row3 - row0, // left, right
+        row3 + row1, row3 - row1, // bottom, top
+        row3 + row2, row3 - row2  // near, far
+    };
+
+    const glm::vec3 minimum(c.chunkX * CHUNK_SIZE,
+                            c.chunkY * SUBCHUNK_HEIGHT,
+                            c.chunkZ * CHUNK_SIZE);
+    const glm::vec3 center = minimum + glm::vec3(CHUNK_SIZE, SUBCHUNK_HEIGHT, CHUNK_SIZE) * 0.5f;
+    const glm::vec3 halfExtent(CHUNK_SIZE * 0.5f, SUBCHUNK_HEIGHT * 0.5f, CHUNK_SIZE * 0.5f);
+
+    for (glm::vec4& plane : planes) {
+        const glm::vec3 unnormalizedNormal(plane);
+        const float length = glm::length(unnormalizedNormal);
+        if (length <= 1e-6f) {
+            // A degenerate plane must never discard all world geometry.
             continue;
         }
-
-        float t1 = (mn - o) / d;
-        float t2 = (mx - o) / d;
-
-        int sign = -1;
-
-        if (t1 > t2) {
-            std::swap(t1, t2);
-            sign = 1;
-        }
-
-        if (t1 > tMin) {
-            tMin = t1;
-            normal = glm::ivec3(0);
-            normal[axis] = sign;
-        }
-
-        tMax = std::min(tMax, t2);
-
-        if (tMin > tMax) {
+        plane /= length;
+        const glm::vec3 normal(plane);
+        const float signedDistance = glm::dot(normal, center) + plane.w;
+        const float projectedRadius = glm::dot(glm::abs(normal), halfExtent);
+        if (signedDistance < -projectedRadius) {
             return false;
         }
     }
-
-    if (tMax < 0.0f || tMin > maxDistance) {
-        return false;
-    }
-
-    hitDistance = tMin;
-    hitNormal = normal;
     return true;
 }
-
-} // namespace
-
-// ------------------------------------------------------------
-// DÜNYA
-// ------------------------------------------------------------
-
-World::World() {
-    std::random_device rd;
-    seed = (static_cast<std::uint32_t>(rd()) << 16) ^ rd();
-
-    std::cout << "World seed: " << seed << '\n';
-
-    generateWorld();
-}
-
-int World::floorDiv(int value, int divisor) {
-    int result = value / divisor;
-    const int remainder = value % divisor;
-
-    if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
-        --result;
-    }
-
-    return result;
-}
-
-// ------------------------------------------------------------
-// DETERMINISTIK HASH VE GÜRÜLTÜ
-// ------------------------------------------------------------
-
-std::uint32_t World::hash2D(int x, int z) const {
-    std::uint32_t h = seed;
-
-    h ^= static_cast<std::uint32_t>(x) * 0x8da6b343u;
-    h ^= static_cast<std::uint32_t>(z) * 0xd8163841u;
-
-    h ^= h >> 13;
-    h *= 0x85ebca6bu;
-    h ^= h >> 16;
-    h *= 0xc2b2ae35u;
-    h ^= h >> 16;
-
-    return h;
-}
-
-std::uint32_t World::hash3D(int x, int y, int z) const {
-    std::uint32_t h = hash2D(x, z);
-    h ^= static_cast<std::uint32_t>(y) * 0xcb1ab31fu;
-
-    h ^= h >> 15;
-    h *= 0x2c1b3c6du;
-    h ^= h >> 12;
-    h *= 0x297a2d39u;
-    h ^= h >> 15;
-
-    return h;
-}
-
-float World::random01(int x, int z) const {
-    return static_cast<float>(hash2D(x, z) & 0x00FFFFFFu)
-        / static_cast<float>(0x01000000u);
-}
-
-float World::noise2D(float x, float z) const {
-    const int ix = static_cast<int>(std::floor(x));
-    const int iz = static_cast<int>(std::floor(z));
-
-    const float fx = smoothstep(x - static_cast<float>(ix));
-    const float fz = smoothstep(z - static_cast<float>(iz));
-
-    const auto value = [this](int px, int pz) {
-        return random01(px, pz) * 2.0f - 1.0f;
-    };
-
-    const float a = lerp(
-        value(ix, iz),
-        value(ix + 1, iz),
-        fx
-    );
-
-    const float b = lerp(
-        value(ix, iz + 1),
-        value(ix + 1, iz + 1),
-        fx
-    );
-
-    return lerp(a, b, fz);
-}
-
-float World::noise3D(float x, float y, float z) const {
-    const int ix = static_cast<int>(std::floor(x));
-    const int iy = static_cast<int>(std::floor(y));
-    const int iz = static_cast<int>(std::floor(z));
-
-    const float fx = smoothstep(x - static_cast<float>(ix));
-    const float fy = smoothstep(y - static_cast<float>(iy));
-    const float fz = smoothstep(z - static_cast<float>(iz));
-
-    const auto value = [this](int px, int py, int pz) {
-        return static_cast<float>(
-            hash3D(px, py, pz) & 0x00FFFFFFu
-        ) / static_cast<float>(0x00800000u) - 1.0f;
-    };
-
-    const float c000 = value(ix,     iy,     iz);
-    const float c100 = value(ix + 1, iy,     iz);
-    const float c010 = value(ix,     iy + 1, iz);
-    const float c110 = value(ix + 1, iy + 1, iz);
-    const float c001 = value(ix,     iy,     iz + 1);
-    const float c101 = value(ix + 1, iy,     iz + 1);
-    const float c011 = value(ix,     iy + 1, iz + 1);
-    const float c111 = value(ix + 1, iy + 1, iz + 1);
-
-    const float x00 = lerp(c000, c100, fx);
-    const float x10 = lerp(c010, c110, fx);
-    const float x01 = lerp(c001, c101, fx);
-    const float x11 = lerp(c011, c111, fx);
-
-    const float y0 = lerp(x00, x10, fy);
-    const float y1 = lerp(x01, x11, fy);
-
-    return lerp(y0, y1, fz);
-}
-
-float World::terrainHeight(int x, int z) const {
-    float total = 0.0f;
-    float amplitude = 1.0f;
-    float frequency = 0.015f;
-    float amplitudeSum = 0.0f;
-
-    for (int octave = 0; octave < 5; ++octave) {
-        total += noise2D(
-            static_cast<float>(x) * frequency,
-            static_cast<float>(z) * frequency
-        ) * amplitude;
-
-        amplitudeSum += amplitude;
-        amplitude *= 0.5f;
-        frequency *= 2.0f;
-    }
-
-    const float broadHills = noise2D(
-        static_cast<float>(x) * 0.006f,
-        static_cast<float>(z) * 0.006f
-    );
-
-    const float normalized = total / amplitudeSum;
-
-    const float height =
-        14.0f +
-        normalized * 22.0f +
-        broadHills * 8.0f;
-
-    return std::clamp(
-        std::floor(height),
-        3.0f,
-        static_cast<float>(CHUNK_HEIGHT - 8)
-    );
-}
-
-// ------------------------------------------------------------
-// KÜÇÜK MAĞARALAR
-// ------------------------------------------------------------
-
-bool World::isCave(
-    int x,
-    int y,
-    int z,
-    int surfaceHeight
-) const {
-    // Yüzeye ve dünyanın alt sınırına yakın bölgelerde
-    // mağara oluşumunu sınırla.
-    if (y < 5 || y >= surfaceHeight - 3) {
-        return false;
-    }
-
-    // İki farklı ölçekteki gürültüyü birlikte kullanmak,
-    // devasa boşlukları azaltır ve kısa tünel kümeleri üretir.
-    const float broad = noise3D(
-        static_cast<float>(x) * 0.105f,
-        static_cast<float>(y) * 0.14f,
-        static_cast<float>(z) * 0.105f
-    );
-
-    const float detail = noise3D(
-        static_cast<float>(x) * 0.23f + 17.0f,
-        static_cast<float>(y) * 0.21f + 31.0f,
-        static_cast<float>(z) * 0.23f + 11.0f
-    );
-
-    return broad > 0.57f && detail > -0.12f;
-}
-
-// ------------------------------------------------------------
-// BLOK OKUMA VE YAZMA
-// ------------------------------------------------------------
-
-Block World::getBlock(int x, int y, int z) const {
-    if (y < 0 || y >= CHUNK_HEIGHT) {
-        return Block::Air;
-    }
-
-    const int cx = floorDiv(x, CHUNK_SIZE);
-    const int cz = floorDiv(z, CHUNK_SIZE);
-
-    const auto it = chunks.find({cx, cz});
-
-    if (it == chunks.end()) {
-        return Block::Air;
-    }
-
-    const BlockPosition position{x, y, z};
-    const auto edit = blockEdits.find(position);
-
-    if (edit != blockEdits.end()) {
-        return edit->second;
-    }
-
-    const int lx = x - cx * CHUNK_SIZE;
-    const int lz = z - cz * CHUNK_SIZE;
-
-    return it->second.blocks[lx][y][lz];
-}
-
-void World::markChunkAndNeighborsModified(int x, int z) {
-    const int cx = floorDiv(x, CHUNK_SIZE);
-    const int cz = floorDiv(z, CHUNK_SIZE);
-
-    constexpr int offsets[5][2] = {
-        { 0,  0},
-        {-1,  0},
-        { 1,  0},
-        { 0, -1},
-        { 0,  1}
-    };
-
-    for (const auto& offset : offsets) {
-        const auto it = chunks.find({
-            cx + offset[0],
-            cz + offset[1]
-        });
-
-        if (it != chunks.end()) {
-            it->second.modified = true;
-        }
-    }
-}
-
-void World::setBlock(int x, int y, int z, Block block) {
-    if (y < 0 || y >= CHUNK_HEIGHT) {
-        return;
-    }
-
-    const BlockPosition position{x, y, z};
-
-    // Değişiklik chunk belleğinden bağımsız saklanır.
-    blockEdits[position] = block;
-
-    const int cx = floorDiv(x, CHUNK_SIZE);
-    const int cz = floorDiv(z, CHUNK_SIZE);
-
-    auto it = chunks.find({cx, cz});
-
-    if (it == chunks.end()) {
-        return;
-    }
-
-    const int lx = x - cx * CHUNK_SIZE;
-    const int lz = z - cz * CHUNK_SIZE;
-
-    it->second.blocks[lx][y][lz] = block;
-
-    markChunkAndNeighborsModified(x, z);
-}
-
-// Arazi üretiminde oyuncu değişikliklerini kaydetmeden yaz.
-void World::writeGeneratedBlock(int x, int y, int z, Block block) {
-    if (y < 0 || y >= CHUNK_HEIGHT) {
-        return;
-    }
-
-    const int cx = floorDiv(x, CHUNK_SIZE);
-    const int cz = floorDiv(z, CHUNK_SIZE);
-
-    auto it = chunks.find({cx, cz});
-
-    if (it == chunks.end()) {
-        return;
-    }
-
-    const int lx = x - cx * CHUNK_SIZE;
-    const int lz = z - cz * CHUNK_SIZE;
-
-    it->second.blocks[lx][y][lz] = block;
-    it->second.modified = true;
-}
-
-// ------------------------------------------------------------
-// CHUNK ARAZİSİ
-// ------------------------------------------------------------
-
-void World::generateChunkTerrain(Chunk& chunk) {
-    const int originX = chunk.chunkX * CHUNK_SIZE;
-    const int originZ = chunk.chunkZ * CHUNK_SIZE;
-
-    for (int x = 0; x < CHUNK_SIZE; ++x) {
-        for (int z = 0; z < CHUNK_SIZE; ++z) {
-            const int wx = originX + x;
-            const int wz = originZ + z;
-
-            const int height = static_cast<int>(
-                terrainHeight(wx, wz)
-            );
-
-            for (int y = 0; y <= height; ++y) {
-                if (isCave(wx, y, wz, height)) {
-                    chunk.blocks[x][y][z] = Block::Air;
-                } else if (y == height) {
-                    chunk.blocks[x][y][z] = Block::Grass;
-                } else if (y >= height - 3) {
-                    chunk.blocks[x][y][z] = Block::Dirt;
-                } else {
-                    chunk.blocks[x][y][z] = Block::Stone;
-                }
-            }
-
-            // Short grass az miktarda ve yalnızca yüzeyde çıkar.
-            if (
-                chunk.blocks[x][height][z] == Block::Grass &&
-                height + 1 < CHUNK_HEIGHT &&
-                random01(wx + 7919, wz - 1543) < 0.035f
-            ) {
-                chunk.blocks[x][height + 1][z] = Block::ShortGrass;
-            }
-        }
-    }
-
-    chunk.modified = true;
-}
-
-// ------------------------------------------------------------
-// AĞAÇLAR VE YÜZEY BİTKİLERİ
-// ------------------------------------------------------------
-
-void World::generateTree(int x, int y, int z) {
-    const int treeHeight =
-        4 + static_cast<int>(random01(x + 97, z - 53) * 2.0f);
-
-    for (int i = 0; i < treeHeight; ++i) {
-        writeGeneratedBlock(x, y + i, z, Block::Wood);
-    }
-
-    const int top = y + treeHeight - 1;
-
-    for (int dx = -2; dx <= 2; ++dx) {
-        for (int dz = -2; dz <= 2; ++dz) {
-            for (int dy = -1; dy <= 2; ++dy) {
-                const int spread = std::abs(dx) + std::abs(dz);
-
-                if (spread > 3) {
-                    continue;
-                }
-
-                if (dy == 2 && spread > 1) {
-                    continue;
-                }
-
-                const int lx = x + dx;
-                const int ly = top + dy;
-                const int lz = z + dz;
-
-                if (ly < 0 || ly >= CHUNK_HEIGHT) {
-                    continue;
-                }
-
-                if (getBlock(lx, ly, lz) == Block::Air) {
-                    writeGeneratedBlock(lx, ly, lz, Block::Leaves);
-                }
-            }
-        }
-    }
-}
-
-void World::generateVegetation() {
-    // Ağaçların chunk sınırını aşabilmesi için her yüklü
-    // chunk'ın yakın çevresindeki aday merkezleri incelenir.
-    for (const auto& entry : chunks) {
-        const Chunk& chunk = entry.second;
-
-        const int minX = chunk.chunkX * CHUNK_SIZE;
-        const int maxX = minX + CHUNK_SIZE - 1;
-        const int minZ = chunk.chunkZ * CHUNK_SIZE;
-        const int maxZ = minZ + CHUNK_SIZE - 1;
-
-        const int gridMinX = floorDiv(minX - 3, 12);
-        const int gridMaxX = floorDiv(maxX + 3, 12);
-        const int gridMinZ = floorDiv(minZ - 3, 12);
-        const int gridMaxZ = floorDiv(maxZ + 3, 12);
-
-        for (int gx = gridMinX; gx <= gridMaxX; ++gx) {
-            for (int gz = gridMinZ; gz <= gridMaxZ; ++gz) {
-                if (random01(gx + 231, gz - 491) > 0.13f) {
-                    continue;
-                }
-
-                const int x = gx * 12 +
-                    static_cast<int>(random01(gx, gz + 91) * 12.0f);
-
-                const int z = gz * 12 +
-                    static_cast<int>(random01(gx - 71, gz) * 12.0f);
-
-                // Ağaç tabanını yalnızca bir kez üret.
-                if (
-                    x < minX || x > maxX ||
-                    z < minZ || z > maxZ
-                ) {
-                    continue;
-                }
-
-                const int surface = static_cast<int>(
-                    terrainHeight(x, z)
-                );
-
-                if (getBlock(x, surface, z) != Block::Grass) {
-                    continue;
-                }
-
-                if (getBlock(x, surface + 1, z) != Block::Air &&
-                    getBlock(x, surface + 1, z) != Block::ShortGrass) {
-                    continue;
-                }
-
-                generateTree(x, surface + 1, z);
-            }
-        }
-    }
-}
-
-// Oyuncunun düzenlemelerini prosedürel üretimin üzerine uygula.
-void World::applyBlockEdits() {
-    for (const auto& entry : blockEdits) {
-        const BlockPosition& p = entry.first;
-
-        if (p.y < 0 || p.y >= CHUNK_HEIGHT) {
-            continue;
-        }
-
-        const int cx = floorDiv(p.x, CHUNK_SIZE);
-        const int cz = floorDiv(p.z, CHUNK_SIZE);
-
-        auto it = chunks.find({cx, cz});
-
-        if (it == chunks.end()) {
-            continue;
-        }
-
-        const int lx = p.x - cx * CHUNK_SIZE;
-        const int lz = p.z - cz * CHUNK_SIZE;
-
-        it->second.blocks[lx][p.y][lz] = entry.second;
-        it->second.modified = true;
-    }
-}
-
-// ------------------------------------------------------------
-// 7x7 CHUNK AKTARIMI
-// ------------------------------------------------------------
-
-void World::generateWorld() {
-    updateStreaming(0, 0);
-}
-
-void World::updateStreaming(int centerChunkX, int centerChunkZ) {
-    constexpr int MAX_NEW_CHUNKS_PER_FRAME = 1;
-
-    bool changed = false;
-    int createdThisFrame = 0;
-
-    // Alan dışındaki chunk'ları kaldır.
-    for (auto it = chunks.begin(); it != chunks.end();) {
-        const int cx = it->first.first;
-        const int cz = it->first.second;
-
-        if (
-            std::abs(cx - centerChunkX) > LOAD_RADIUS ||
-            std::abs(cz - centerChunkZ) > LOAD_RADIUS
-        ) {
-            constexpr int neighbors[4][2] = {
-                {-1, 0}, {1, 0}, {0, -1}, {0, 1}
-            };
-
-            for (const auto& n : neighbors) {
-                auto neighbor = chunks.find({
-                    cx + n[0], cz + n[1]
-                });
-
-                if (neighbor != chunks.end()) {
-                    neighbor->second.modified = true;
-                }
-            }
-
-            it = chunks.erase(it);
-            changed = true;
-        } else {
-            ++it;
-        }
-    }
-
-    // Her karede en fazla bir yeni chunk üret.
-    for (int cx = centerChunkX - LOAD_RADIUS;
-         cx <= centerChunkX + LOAD_RADIUS &&
-         createdThisFrame < MAX_NEW_CHUNKS_PER_FRAME;
-         ++cx) {
-
-        for (int cz = centerChunkZ - LOAD_RADIUS;
-             cz <= centerChunkZ + LOAD_RADIUS &&
-             createdThisFrame < MAX_NEW_CHUNKS_PER_FRAME;
-             ++cz) {
-
-            const std::pair<int, int> key{cx, cz};
-
-            if (chunks.find(key) != chunks.end()) {
-                continue;
-            }
-
-            auto [it, inserted] = chunks.try_emplace(key, cx, cz);
-
-            if (!inserted) {
-                continue;
-            }
-
-            generateChunkTerrain(it->second);
-            applyBlockEdits();
-
-            // Yalnızca yeni chunk'ın komşularını işaretle.
-            constexpr int neighbors[4][2] = {
-                {-1, 0}, {1, 0}, {0, -1}, {0, 1}
-            };
-
-            for (const auto& n : neighbors) {
-                auto neighbor = chunks.find({
-                    cx + n[0], cz + n[1]
-                });
-
-                if (neighbor != chunks.end()) {
-                    neighbor->second.modified = true;
-                }
-            }
-
-            ++createdThisFrame;
-            changed = true;
-        }
-    }
-
-    // Ağaçları yalnızca 7x7 alan tamamlandığında üret.
-    // Her yeni chunk oluşturulduğunda tüm dünyayı tarama.
-    if (changed && chunks.size() == LOAD_DIAMETER * LOAD_DIAMETER) {
-        generateVegetation();
-        applyBlockEdits();
-    }
-}
-
-// ------------------------------------------------------------
-// ÇİZİM
-// ------------------------------------------------------------
-
-void World::render() {
-    constexpr int MAX_MESH_UPDATES_PER_FRAME = 2;
-    int updated = 0;
-
-    for (auto& entry : chunks) {
-        Chunk& chunk = entry.second;
-
-        if (chunk.modified &&
-            updated < MAX_MESH_UPDATES_PER_FRAME) {
-            chunk.updateMesh(*this);
-            ++updated;
-        }
-
-        chunk.render();
-    }
-}
-
-// ------------------------------------------------------------
-// RAYCAST
-// ------------------------------------------------------------
-
-bool World::raycast(
-    const glm::vec3& origin,
-    const glm::vec3& direction,
-    float maxDistance,
-    glm::ivec3& hitBlock,
-    glm::ivec3& normal
-) {
-    if (maxDistance <= 0.0f) {
-        return false;
-    }
-
-    const glm::vec3 end = origin + direction * maxDistance;
-
-    const int minX = static_cast<int>(
-        std::floor(std::min(origin.x, end.x))
-    );
-    const int maxX = static_cast<int>(
-        std::floor(std::max(origin.x, end.x))
-    );
-
-    const int minY = std::max(
-        0,
-        static_cast<int>(std::floor(std::min(origin.y, end.y)))
-    );
-    const int maxY = std::min(
-        CHUNK_HEIGHT - 1,
-        static_cast<int>(std::floor(std::max(origin.y, end.y)))
-    );
-
-    const int minZ = static_cast<int>(
-        std::floor(std::min(origin.z, end.z))
-    );
-    const int maxZ = static_cast<int>(
-        std::floor(std::max(origin.z, end.z))
-    );
-
-    float closestDistance = maxDistance;
-    bool found = false;
-
-    for (int x = minX; x <= maxX; ++x) {
-        for (int y = minY; y <= maxY; ++y) {
-            for (int z = minZ; z <= maxZ; ++z) {
-                const Block block = getBlock(x, y, z);
-                const BlockProperties properties =
-                    blockProperties(block);
-
-                if (!properties.selectable) {
-                    continue;
-                }
-
-                std::array<BlockAABB, 2> boxes{};
-                std::size_t count = blockHitboxes(block, boxes);
-
-                // Çapraz bitkiler ve su için seçilebilir bir
-                // hedef hacmi kullan.
-                if (count == 0) {
-                    boxes[0] = {
-                        glm::vec3(0.0f),
-                        glm::vec3(1.0f)
-                    };
-                    count = 1;
-                }
-
-                const glm::vec3 cell(
-                    static_cast<float>(x),
-                    static_cast<float>(y),
-                    static_cast<float>(z)
-                );
-
-                for (std::size_t i = 0; i < count; ++i) {
-                    float distance = 0.0f;
-                    glm::ivec3 hitNormal(0);
-
-                    if (!rayBox(
-                        origin,
-                        direction,
-                        cell + boxes[i].min,
-                        cell + boxes[i].max,
-                        closestDistance,
-                        distance,
-                        hitNormal
-                    )) {
-                        continue;
-                    }
-
-                    if (distance < 0.0f || distance > closestDistance) {
-                        continue;
-                    }
-
-                    closestDistance = distance;
-                    hitBlock = glm::ivec3(x, y, z);
-                    normal = hitNormal;
-                    found = true;
-                }
-            }
-        }
-    }
-
-    return found;
-}
+void World::render(const glm::mat4& vp) { int updates=0; for(auto& e:chunks) { Chunk& c=e.second; if(c.modified && updates<2) { c.updateMesh(*this); ++updates; } if(isVisible(c,vp)) c.render(); } }
+bool World::raycast(const glm::vec3&o,const glm::vec3&d,float maxD,glm::ivec3& hit,glm::ivec3& normal) { glm::vec3 end=o+d*maxD; int minX=int(std::floor(std::min(o.x,end.x))),maxX=int(std::floor(std::max(o.x,end.x))),minY=std::max(WORLD_MIN_Y,int(std::floor(std::min(o.y,end.y)))),maxY=std::min(WORLD_MAX_Y,int(std::floor(std::max(o.y,end.y)))),minZ=int(std::floor(std::min(o.z,end.z))),maxZ=int(std::floor(std::max(o.z,end.z))); float closest=maxD; bool found=false; for(int x=minX;x<=maxX;++x)for(int y=minY;y<=maxY;++y)for(int z=minZ;z<=maxZ;++z){Block b=getBlock(x,y,z);if(!blockProperties(b).selectable)continue;std::array<BlockAABB,2> boxes{};auto count=blockHitboxes(b,boxes);if(!count){boxes[0]={glm::vec3(0),glm::vec3(1)};count=1;}for(std::size_t i=0;i<count;++i){float dist;glm::ivec3 n;if(rayBox(o,d,glm::vec3(x,y,z)+boxes[i].min,glm::vec3(x,y,z)+boxes[i].max,closest,dist,n)&&dist>=0&&dist<=closest){closest=dist;hit={x,y,z};normal=n;found=true;}}}return found; }

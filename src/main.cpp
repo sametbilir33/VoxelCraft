@@ -19,6 +19,8 @@
 
 #include <cmath>
 #include <iomanip>
+#include <memory>
+#include <string>
 
 constexpr int WIDTH = 1280;
 constexpr int HEIGHT = 720;
@@ -44,6 +46,233 @@ GLuint crosshairVBO = 0;
 GLuint outlineVAO = 0;
 GLuint outlineVBO = 0;
 GLuint blockAtlasTexture = 0;
+
+// ============================================================
+// ANA MENU
+// ============================================================
+
+WorldSettings pendingWorldSettings;
+bool menuActive = true;
+bool startWorldRequested = false;
+GLuint menuVAO = 0;
+GLuint menuVBO = 0;
+
+void appendMenuRect(std::vector<Vertex>& vertices, float x0, float y0, float x1, float y1, bool textured = false) {
+    const glm::vec2 uv[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    const glm::vec3 p[4] = {{x0,y0,0}, {x1,y0,0}, {x1,y1,0}, {x0,y1,0}};
+    constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
+    for (int i : indices) vertices.push_back({p[i], glm::vec3(1), textured ? uv[i] : glm::vec2(0), 0.0f});
+}
+
+std::array<unsigned char, 7> menuGlyph(char c) {
+    switch (c) {
+        case 'A': return {14,17,17,31,17,17,17}; case 'B': return {30,17,17,30,17,17,30};
+        case 'C': return {15,16,16,16,16,16,15}; case 'D': return {30,17,17,17,17,17,30};
+        case 'E': return {31,16,16,30,16,16,31}; case 'G': return {15,16,16,23,17,17,15};
+        case 'H': return {17,17,17,31,17,17,17}; case 'I': return {31,4,4,4,4,4,31};
+        case 'K': return {17,18,20,24,20,18,17}; case 'L': return {16,16,16,16,16,16,31};
+        case 'M': return {17,27,21,21,17,17,17}; case 'N': return {17,25,21,19,17,17,17};
+        case 'O': return {14,17,17,17,17,17,14}; case 'R': return {30,17,17,30,20,18,17};
+        case 'S': return {15,16,16,14,1,1,30};  case 'T': return {31,4,4,4,4,4,4};
+        case 'U': return {17,17,17,17,17,17,14}; case 'V': return {17,17,17,17,17,10,4};
+        case 'X': return {17,17,10,4,10,17,17}; case 'Y': return {17,17,10,4,4,4,4};
+        case 'Z': return {31,1,2,4,8,16,31}; case '0': return {14,17,19,21,25,17,14};
+        case '1': return {4,12,4,4,4,4,14}; case '2': return {14,17,1,2,4,8,31};
+        case '3': return {30,1,1,14,1,1,30}; case '4': return {2,6,10,18,31,2,2};
+        case '5': return {31,16,16,30,1,1,30}; case '6': return {14,16,16,30,17,17,14};
+        case '7': return {31,1,2,4,8,8,8}; case '8': return {14,17,17,14,17,17,14};
+        case '9': return {14,17,17,15,1,1,14}; case '+': return {0,4,4,31,4,4,0};
+        case '-': return {0,0,0,31,0,0,0}; case ':': return {0,4,0,0,4,0,0};
+        default: return {0,0,0,0,0,0,0};
+    }
+}
+
+void appendMenuText(std::vector<Vertex>& vertices, const std::string& text, float centerX, float baselineY, float scale) {
+    const float width = static_cast<float>(text.size()) * 6.0f * scale;
+    float x = centerX - width * 0.5f;
+    for (char raw : text) {
+        const auto glyph = menuGlyph(raw);
+        for (int row = 0; row < 7; ++row) for (int col = 0; col < 5; ++col)
+            if (glyph[row] & (1 << (4 - col)))
+                appendMenuRect(vertices, x + col * scale, baselineY - row * scale,
+                               x + (col + 1) * scale, baselineY - (row + 1) * scale);
+        x += 6.0f * scale;
+    }
+}
+
+void drawMenuBatch(Shader& shader, const std::vector<Vertex>& vertices, const glm::vec3& tint, bool textured) {
+    if (menuVAO == 0) { glGenVertexArrays(1, &menuVAO); glGenBuffers(1, &menuVBO); }
+    glBindVertexArray(menuVAO); glBindBuffer(GL_ARRAY_BUFFER, menuVBO);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(Vertex)), vertices.data(), GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, position))); glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, color))); glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, uv))); glEnableVertexAttribArray(2);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, textureId))); glEnableVertexAttribArray(3);
+    shader.use();
+    shader.setMat4("uProjection", glm::mat4(1.0f)); shader.setMat4("uView", glm::mat4(1.0f)); shader.setMat4("uModel", glm::mat4(1.0f));
+    glUniform1i(glGetUniformLocation(shader.id, "uUseTexture"), textured ? 1 : 0);
+    glUniform1i(glGetUniformLocation(shader.id, "uAtlas"), 0);
+    glUniform3fv(glGetUniformLocation(shader.id, "uTint"), 1, &tint[0]);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+    glBindVertexArray(0);
+}
+
+
+void renderMainMenu(Shader& shader, int width, int height) {
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+
+    // Arka plan
+    std::vector<Vertex> background;
+    appendMenuRect(background, -1.0f, -1.0f, 1.0f, 1.0f, true);
+    bindBlockTextureAtlas(blockAtlasTexture);
+    drawMenuBatch(shader, background, glm::vec3(0.42f, 0.34f, 0.25f), true);
+
+    // Ana panel
+    std::vector<Vertex> panels;
+    appendMenuRect(panels, -0.55f, -0.88f, 0.55f, 0.78f);
+
+    // Başlat butonu
+    appendMenuRect(panels, -0.30f, 0.48f, 0.30f, 0.64f);
+
+    // Ayar satırları
+    const float rows[] = {
+        0.32f, 0.12f, -0.08f, -0.28f, -0.48f, -0.66f
+    };
+
+    for (float y : rows) {
+        appendMenuRect(
+            panels,
+            -0.43f, y - 0.055f,
+             0.43f, y + 0.055f
+        );
+    }
+
+    drawMenuBatch(
+        shader, panels,
+        glm::vec3(0.13f, 0.10f, 0.07f), false
+    );
+
+    // Menü yazıları
+    std::vector<Vertex> text;
+
+    appendMenuText(text, "VOXELCRAFT", 0.0f, 0.84f, 0.022f);
+    appendMenuText(text, "DUNYAYA GIR", 0.0f, 0.585f, 0.014f);
+
+    appendMenuText(
+        text,
+        std::string("DENIZ: ") +
+        (pendingWorldSettings.oceansEnabled ? "ACIK" : "KAPALI"),
+        0.0f, 0.345f, 0.012f
+    );
+
+    appendMenuText(
+        text,
+        std::string("MAGARA: ") +
+        (pendingWorldSettings.cavesEnabled ? "ACIK" : "KAPALI"),
+        0.0f, 0.145f, 0.012f
+    );
+
+    appendMenuText(text, "YUKSEKLIK  -  +", 0.0f, -0.055f, 0.012f);
+    appendMenuText(text, "DENIZ ORANI -  +", 0.0f, -0.255f, 0.012f);
+    appendMenuText(text, "MAGARA ORANI -  +", 0.0f, -0.455f, 0.012f);
+    appendMenuText(text, "DENIZ SEVIYE -  +", 0.0f, -0.635f, 0.012f);
+
+    appendMenuText(text, "SOL TIKLA AYARLARI DEGISTIR",
+                   0.0f, -0.81f, 0.008f);
+
+    drawMenuBatch(
+        shader, text,
+        glm::vec3(0.96f, 0.91f, 0.78f), false
+    );
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+}
+
+
+void handleMenuClick(GLFWwindow* window, double xpos, double ypos) {
+    int w, h;
+    glfwGetWindowSize(window, &w, &h);
+
+    if (w <= 0 || h <= 0)
+        return;
+
+    const float x = static_cast<float>(xpos / w * 2.0 - 1.0);
+    const float y = static_cast<float>(1.0 - ypos / h * 2.0);
+
+    // Panel dışındaki tıklamaları yok say.
+    if (x < -0.55f || x > 0.55f ||
+        y < -0.88f || y > 0.78f) {
+        return;
+    }
+
+    // Dünyaya gir
+    if (x >= -0.30f && x <= 0.30f &&
+        y >= 0.48f && y <= 0.64f) {
+        startWorldRequested = true;
+        return;
+    }
+
+    // Denizleri aç / kapat
+    if (y >= 0.265f && y <= 0.375f) {
+        pendingWorldSettings.oceansEnabled =
+            !pendingWorldSettings.oceansEnabled;
+        return;
+    }
+
+    // Mağaraları aç / kapat
+    if (y >= 0.065f && y <= 0.175f) {
+        pendingWorldSettings.cavesEnabled =
+            !pendingWorldSettings.cavesEnabled;
+        return;
+    }
+
+    // Arazi yüksekliği
+    if (y >= -0.135f && y <= -0.025f) {
+        pendingWorldSettings.terrainAmplitude =
+            std::clamp(
+                pendingWorldSettings.terrainAmplitude +
+                    (x < 0.0f ? -0.1f : 0.1f),
+                0.4f, 1.8f
+            );
+        return;
+    }
+
+    // Deniz oranı
+    if (y >= -0.335f && y <= -0.225f) {
+        pendingWorldSettings.oceanThreshold =
+            std::clamp(
+                pendingWorldSettings.oceanThreshold +
+                    (x < 0.0f ? 0.05f : -0.05f),
+                0.20f, 0.75f
+            );
+        return;
+    }
+
+    // Mağara yoğunluğu
+    if (y >= -0.535f && y <= -0.425f) {
+        pendingWorldSettings.caveDensity =
+            std::clamp(
+                pendingWorldSettings.caveDensity +
+                    (x < 0.0f ? -0.1f : 0.1f),
+                0.2f, 1.5f
+            );
+        return;
+    }
+
+    // Deniz seviyesi
+    if (y >= -0.715f && y <= -0.605f) {
+        pendingWorldSettings.seaLevel =
+            std::clamp(
+                pendingWorldSettings.seaLevel +
+                    (x < 0.0f ? -1 : 1),
+                4, 35
+            );
+        return;
+    }
+}
+
 
 
 // ============================================================
@@ -76,6 +305,7 @@ void mouseCallback(
     double xpos,
     double ypos
 ) {
+    if (menuActive) return;
     if (firstMouse) {
         lastX = static_cast<float>(xpos);
         lastY = static_cast<float>(ypos);
@@ -157,16 +387,30 @@ bool playerIntersectsBlock(
 // ============================================================
 
 void mouseButtonCallback(
-    GLFWwindow*,
+    GLFWwindow* window,
     int button,
     int action,
     int
 ) {
+    if (menuActive) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+            double x, y; glfwGetCursorPos(window, &x, &y);
+            handleMenuClick(window, x, y);
+        }
+        return;
+    }
     if (!activeWorld)
         return;
 
+    // Mouse buttons do not send GLFW_REPEAT, but accepting only PRESS makes
+    // the single-action behaviour explicit if input handling changes later.
     if (action != GLFW_PRESS)
         return;
+
+    if (button != GLFW_MOUSE_BUTTON_LEFT &&
+        button != GLFW_MOUSE_BUTTON_RIGHT) {
+        return;
+    }
 
     glm::ivec3 hit;
     glm::ivec3 normal;
@@ -183,7 +427,7 @@ void mouseButtonCallback(
 
     // Sol tık = kır
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
-
+        // raycast only returns selectable, non-Air blocks.
         activeWorld->setBlock(
             hit.x,
             hit.y,
@@ -199,8 +443,7 @@ void mouseButtonCallback(
 
         glm::ivec3 place = hit + normal;
 
-        if (place.y < 0 ||
-            place.y >= CHUNK_HEIGHT) {
+        if (!World::inWorldY(place.y)) {
             return;
         }
 
@@ -210,11 +453,9 @@ if (playerIntersectsBlock(player, place, placeBlock)) {
     return;
 }
 
-        if (activeWorld->getBlock(
-                place.x,
-                place.y,
-                place.z
-            ) != Block::Air) {
+        // The ray hit is never Air. The adjacent cell must be actual empty
+        // space; this deliberately does not replace plants/water yet.
+        if (activeWorld->getBlock(place.x, place.y, place.z) != Block::Air) {
             return;
         }
 
@@ -461,8 +702,15 @@ void createPreviewCube() {
         }
     };
 
+    static const glm::vec2 torchUV[4] = {
+        {0.375f, 0.0f}, {0.625f, 0.0f},
+        {0.625f, 1.0f}, {0.375f, 1.0f}
+    };
+
     const Block block = selectedBlock();
     const BlockProperties properties = blockProperties(block);
+    const glm::vec2* previewUV =
+        properties.shape == BlockShape::Torch ? torchUV : nullptr;
 
     // Varsayılan boyut: tam blok.
     glm::vec3 localMin(0.0f);
@@ -510,7 +758,7 @@ void createPreviewCube() {
             vertices.push_back({
                 centeredPosition,
                 color,
-                faceUV[face][cornerIndex],
+                previewUV ? previewUV[cornerIndex] : faceUV[face][cornerIndex],
                 tileId
             });
         }
@@ -680,114 +928,6 @@ void renderCrosshair(
 }
 
 // ============================================================
-// DEBUG: KAMERA YÖNÜ, HEDEF BLOK VE BLOK YÜZÜ
-// ============================================================
-
-void debugTargetInfo(
-    World& world,
-    const glm::ivec3& hit,
-    const glm::ivec3& normal
-) {
-    static bool initialized = false;
-    static glm::ivec3 lastHit(-999999);
-    static glm::ivec3 lastNormal(0);
-    static int lastDirection = -1;
-
-    const glm::vec3 forward = glm::normalize(camera.forward());
-
-    // Kuzey: -Z, Doğu: +X, Güney: +Z, Batı: -X
-    float angle = glm::degrees(
-        std::atan2(forward.x, -forward.z)
-    );
-
-    if (angle < 0.0f)
-        angle += 360.0f;
-
-    const char* directions[] = {
-        "N", "NE", "E", "SE",
-        "S", "SW", "W", "NW"
-    };
-
-    const int direction = static_cast<int>(
-        std::floor((angle + 22.5f) / 45.0f)
-    ) % 8;
-
-    // Chunk.cpp içindeki yüz sıralamasıyla aynı.
-    int face = -1;
-    const char* faceName = "UNKNOWN";
-
-    if (normal.z < 0) {
-        face = 0;
-        faceName = "-Z / NORTH";
-    } else if (normal.z > 0) {
-        face = 1;
-        faceName = "+Z / SOUTH";
-    } else if (normal.x < 0) {
-        face = 2;
-        faceName = "-X / WEST";
-    } else if (normal.x > 0) {
-        face = 3;
-        faceName = "+X / EAST";
-    } else if (normal.y > 0) {
-        face = 4;
-        faceName = "+Y / TOP";
-    } else if (normal.y < 0) {
-        face = 5;
-        faceName = "-Y / BOTTOM";
-    }
-
-    // Aynı bilgi her karede konsolu doldurmasın.
-    const bool changed =
-        !initialized ||
-        hit != lastHit ||
-        normal != lastNormal ||
-        direction != lastDirection;
-
-    if (!changed)
-        return;
-
-    initialized = true;
-    lastHit = hit;
-    lastNormal = normal;
-    lastDirection = direction;
-
-    const Block block = world.getBlock(
-        hit.x,
-        hit.y,
-        hit.z
-    );
-
-    std::cout
-        << "\n========== VOXEL DEBUG ==========\n"
-        << "Kamera yonu : " << directions[direction]
-        << " (" << angle << " derece)\n"
-        << "Forward     : "
-        << forward.x << ", "
-        << forward.y << ", "
-        << forward.z << '\n'
-        << "Hedef blok  : " << blockName(block) << '\n'
-        << "Koordinat   : "
-        << hit.x << ", "
-        << hit.y << ", "
-        << hit.z << '\n'
-        << "Hedef yuz   : " << faceName << '\n'
-        << "Normal      : "
-        << normal.x << ", "
-        << normal.y << ", "
-        << normal.z << '\n';
-
-    if (face >= 0) {
-        std::cout
-            << "Atlas tile  : "
-            << blockTextureId(block, face)
-            << '\n';
-    }
-
-    std::cout
-        << "=================================\n";
-}
-
-// ============================================================
 // BAKILAN BLOĞUN SEÇİM ÇERÇEVESİ
 // ============================================================
 void renderTargetOutline(Shader& shader, World& world) {
@@ -802,8 +942,6 @@ void renderTargetOutline(Shader& shader, World& world) {
         )) {
         return;
     }
-
-    debugTargetInfo(world, hit, normal);
 
     const float e = 0.003f;
     const float x0 = static_cast<float>(hit.x) - e;
@@ -1061,7 +1199,7 @@ int main() {
     glfwSetInputMode(
         window,
         GLFW_CURSOR,
-        GLFW_CURSOR_DISABLED
+        GLFW_CURSOR_NORMAL
     );
 
 
@@ -1094,21 +1232,28 @@ int main() {
 
         blockAtlasTexture = createBlockTextureAtlas("assets/blocks");
 
-        World world;
+        std::unique_ptr<World> world;
 
-        activeWorld = &world;
-
-
-        player.position =
-            glm::vec3(
-                48.0f,
-                40.0f,
-                48.0f
-            );
-
-
-        camera.position =
-            player.eyePosition();
+        const auto startWorld = [&]() {
+            world = std::make_unique<World>(pendingWorldSettings);
+            activeWorld = world.get();
+            int spawnY = WORLD_MAX_Y;
+            while (spawnY >= WORLD_MIN_Y &&
+                   !blockProperties(world->getBlock(48, spawnY, 48)).solid) {
+                --spawnY;
+            }
+            ++spawnY;
+            while (spawnY <= WORLD_MAX_Y &&
+                   world->getBlock(48, spawnY, 48) == Block::Water) {
+                ++spawnY;
+            }
+            player.position = glm::vec3(48.0f, static_cast<float>(spawnY), 48.0f);
+            player.velocity = glm::vec3(0.0f);
+            camera.position = player.eyePosition();
+            firstMouse = true;
+            menuActive = false;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        };
 
 
         // GUI VAO'ları
@@ -1141,11 +1286,32 @@ int main() {
             if (dt > 0.05f)
                 dt = 0.05f;
 
+            glfwPollEvents();
+
+            if (startWorldRequested) {
+                startWorldRequested = false;
+                startWorld();
+            }
+
+            int w;
+            int h;
+            glfwGetFramebufferSize(window, &w, &h);
+            if (w <= 0 || h <= 0) continue;
+
+            if (menuActive) {
+                glViewport(0, 0, w, h);
+                glClearColor(0.12f, 0.09f, 0.06f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                renderMainMenu(shader, w, h);
+                glfwSwapBuffers(window);
+                continue;
+            }
+
 
             processInput(
                 window,
                 dt,
-                world
+                *world
             );
 
 
@@ -1157,24 +1323,7 @@ const int playerChunkZ = static_cast<int>(
     std::floor(player.position.z / CHUNK_SIZE)
 );
 
-world.updateStreaming(playerChunkX, playerChunkZ);
-
-            glfwPollEvents();
-
-
-            int w;
-            int h;
-
-
-            glfwGetFramebufferSize(
-                window,
-                &w,
-                &h
-            );
-
-
-            if (w <= 0 || h <= 0)
-                continue;
+world->updateStreaming(playerChunkX, playerChunkZ, player.position.y);
 
 
             // =================================================
@@ -1243,9 +1392,9 @@ world.updateStreaming(playerChunkX, playerChunkZ);
             );
 
 
-            world.render();
+            world->render(projection * camera.view());
 
-            renderTargetOutline(shader, world);
+            renderTargetOutline(shader, *world);
 
             // =================================================
             // SAĞ ÜST 3D BLOK

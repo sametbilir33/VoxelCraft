@@ -64,6 +64,14 @@ const glm::vec2 PLANT_UV[4] = {
     {0.0f, 1.0f}
 };
 
+// torch.png is a narrow sprite inside a 16x16 tile.  The torch geometry is
+// narrow as well, so using the complete tile squashed the sprite a second
+// time. Crop the transparent horizontal margins for its cuboid faces.
+const glm::vec2 TORCH_UV[4] = {
+    {0.375f, 0.0f}, {0.625f, 0.0f},
+    {0.625f, 1.0f}, {0.375f, 1.0f}
+};
+
 // Küp köşe sıralaması.
 const int FACE_INDICES[6][4] = {
     {3, 2, 1, 0}, // -Z
@@ -136,14 +144,15 @@ void appendQuad(
     const glm::vec3& color,
     int textureId,
     int face,
-    bool doubleSided = false
+    bool doubleSided = false,
+    const glm::vec2* uvOverride = nullptr
 ) {
     constexpr int TRIANGLES[6] = {
         0, 1, 2,
         0, 2, 3
     };
 
-    const glm::vec2* uv =
+    const glm::vec2* uv = uvOverride != nullptr ? uvOverride :
         (face >= 0 && face < 6)
             ? FACE_UV[face]
             : PLANT_UV;
@@ -236,10 +245,10 @@ void appendCrossPlant(
 // CHUNK
 // ============================================================
 
-Chunk::Chunk(int cx, int cz)
-    : chunkX(cx), chunkZ(cz) {
+Chunk::Chunk(int cx, int cy, int cz)
+    : chunkX(cx), chunkY(cy), chunkZ(cz) {
     for (int x = 0; x < CHUNK_SIZE; ++x) {
-        for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+        for (int y = 0; y < SUBCHUNK_HEIGHT; ++y) {
             for (int z = 0; z < CHUNK_SIZE; ++z) {
                 blocks[x][y][z] = Block::Air;
             }
@@ -266,6 +275,7 @@ void Chunk::updateMesh(const World& world) {
     vertices.reserve(CHUNK_SIZE * CHUNK_SIZE * 6 * 6);
 
     const int worldOriginX = chunkX * CHUNK_SIZE;
+    const int worldOriginY = chunkY * SUBCHUNK_HEIGHT;
     const int worldOriginZ = chunkZ * CHUNK_SIZE;
 
     static const glm::vec3 cube[8] = {
@@ -280,7 +290,7 @@ void Chunk::updateMesh(const World& world) {
     };
 
     for (int x = 0; x < CHUNK_SIZE; ++x) {
-        for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+        for (int y = 0; y < SUBCHUNK_HEIGHT; ++y) {
             for (int z = 0; z < CHUNK_SIZE; ++z) {
                 const Block block = blocks[x][y][z];
 
@@ -290,7 +300,7 @@ void Chunk::updateMesh(const World& world) {
 
                 const glm::vec3 origin(
                     static_cast<float>(worldOriginX + x),
-                    static_cast<float>(y),
+                    static_cast<float>(worldOriginY + y),
                     static_cast<float>(worldOriginZ + z)
                 );
 
@@ -339,7 +349,7 @@ void Chunk::updateMesh(const World& world) {
 
                     const Block neighbor = world.getBlock(
                         worldOriginX + x + offset.x,
-                        y + offset.y,
+                        worldOriginY + y + offset.y,
                         worldOriginZ + z + offset.z
                     );
 
@@ -375,7 +385,8 @@ void Chunk::updateMesh(const World& world) {
                         color,
                         textureId,
                         face,
-                        false
+                        false,
+                        properties.shape == BlockShape::Torch ? TORCH_UV : nullptr
                     );
                 }
             }
