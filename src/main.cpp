@@ -54,6 +54,7 @@ GLuint blockAtlasTexture = 0;
 WorldSettings pendingWorldSettings;
 bool menuActive = true;
 bool startWorldRequested = false;
+bool debugMenuActive = false;
 GLuint menuVAO = 0;
 GLuint menuVBO = 0;
 
@@ -83,6 +84,8 @@ std::array<unsigned char, 7> menuGlyph(char c) {
         case '7': return {31,1,2,4,8,8,8}; case '8': return {14,17,17,14,17,17,14};
         case '9': return {14,17,17,15,1,1,14}; case '+': return {0,4,4,31,4,4,0};
         case '-': return {0,0,0,31,0,0,0}; case ':': return {0,4,0,0,4,0,0};
+        case 'F': return {31,16,16,30,16,16,16};
+        case 'P': return {30,17,17,30,16,16,16};
         default: return {0,0,0,0,0,0,0};
     }
 }
@@ -190,6 +193,69 @@ void renderMainMenu(Shader& shader, int width, int height) {
     glEnable(GL_CULL_FACE);
 }
 
+void renderDebugMenu(Shader& shader, int width, int height) {
+    if (!debugMenuActive || !activeWorld)
+        return;
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+
+    // Koyu arka panel
+    std::vector<Vertex> panels;
+    appendMenuRect(panels, -0.96f, 0.36f, -0.36f, 0.92f);
+    appendMenuRect(panels, -0.93f, 0.40f, -0.39f, 0.88f);
+
+    drawMenuBatch(
+        shader,
+        panels,
+        glm::vec3(0.10f, 0.09f, 0.07f),
+        false
+    );
+
+    const int px = static_cast<int>(std::floor(player.position.x));
+    const int py = static_cast<int>(std::floor(player.position.y));
+    const int pz = static_cast<int>(std::floor(player.position.z));
+
+    const int cx = World::floorDiv(px, CHUNK_SIZE);
+    const int cz = World::floorDiv(pz, CHUNK_SIZE);
+
+    std::vector<Vertex> text;
+
+    appendMenuText(text, "DEBUG MENU", -0.66f, 0.83f, 0.014f);
+    appendMenuText(text, "X: " + std::to_string(px), -0.66f, 0.75f, 0.010f);
+    appendMenuText(text, "Y: " + std::to_string(py), -0.66f, 0.68f, 0.010f);
+    appendMenuText(text, "Z: " + std::to_string(pz), -0.66f, 0.61f, 0.010f);
+
+    appendMenuText(
+        text,
+        "CHUNK X: " + std::to_string(cx),
+        -0.66f, 0.54f, 0.008f
+    );
+
+    appendMenuText(
+        text,
+        "CHUNK Z: " + std::to_string(cz),
+        -0.66f, 0.48f, 0.008f
+    );
+
+    appendMenuText(text, "1: 10000", -0.66f, 0.41f, 0.009f);
+    appendMenuText(text, "2: 100000", -0.66f, 0.35f, 0.009f);
+    appendMenuText(text, "3: 1000000", -0.66f, 0.29f, 0.009f);
+    appendMenuText(text, "4: 5000000", -0.66f, 0.23f, 0.009f);
+
+    appendMenuText(text, "F1 TOGGLE", -0.66f, 0.16f, 0.008f);
+    appendMenuText(text, "ESC CLOSE", -0.66f, 0.10f, 0.008f);
+
+    drawMenuBatch(
+        shader,
+        text,
+        glm::vec3(0.96f, 0.91f, 0.78f),
+        false
+    );
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+}
 
 void handleMenuClick(GLFWwindow* window, double xpos, double ypos) {
     int w, h;
@@ -305,7 +371,7 @@ void mouseCallback(
     double xpos,
     double ypos
 ) {
-    if (menuActive) return;
+    if (menuActive || debugMenuActive) return;
     if (firstMouse) {
         lastX = static_cast<float>(xpos);
         lastY = static_cast<float>(ypos);
@@ -392,6 +458,9 @@ void mouseButtonCallback(
     int action,
     int
 ) {
+    if (debugMenuActive)
+    return;
+
     if (menuActive) {
         if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
             double x, y; glfwGetCursorPos(window, &x, &y);
@@ -478,16 +547,9 @@ void processInput(
     float dt,
     World& world
 ) {
-    if (glfwGetKey(
-            window,
-            GLFW_KEY_ESCAPE
-        ) == GLFW_PRESS) {
 
-        glfwSetWindowShouldClose(
-            window,
-            true
-        );
-    }
+if (debugMenuActive)
+    return;
 
     glm::vec3 fwd = camera.forward();
 
@@ -1288,6 +1350,124 @@ int main() {
 
             glfwPollEvents();
 
+            static bool previousEscape = false;
+
+const bool currentEscape =
+    glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+
+if (currentEscape && !previousEscape) {
+    if (debugMenuActive) {
+        debugMenuActive = false;
+        firstMouse = true;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    } else if (!menuActive) {
+        glfwSetWindowShouldClose(window, true);
+    }
+}
+
+previousEscape = currentEscape;
+
+            // F1: Debug Menu aç/kapat. Tuşa basılı tutunca tekrarlamaz.
+static bool previousF1 = false;
+const bool currentF1 =
+    glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS;
+
+if (!menuActive && currentF1 && !previousF1) {
+    debugMenuActive = !debugMenuActive;
+    firstMouse = true;
+
+    glfwSetInputMode(
+        window,
+        GLFW_CURSOR,
+        debugMenuActive ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED
+    );
+}
+
+previousF1 = currentF1;
+
+static bool previousTeleportKeys[4] = {
+    false, false, false, false
+};
+
+if (debugMenuActive && world) {
+
+    const int teleportKeys[4] = {
+        GLFW_KEY_1,
+        GLFW_KEY_2,
+        GLFW_KEY_3,
+        GLFW_KEY_4
+    };
+
+    const int targets[4] = {
+        10000,
+        100000,
+        1000000,
+        5000000
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        const bool pressed =
+            glfwGetKey(window, teleportKeys[i]) == GLFW_PRESS;
+
+        if (pressed && !previousTeleportKeys[i]) {
+            const int targetX = targets[i];
+            const int targetZ = targets[i];
+
+            int surfaceY = WORLD_MAX_Y;
+
+            // En üstteki katı bloğu bul.
+            while (
+                surfaceY >= WORLD_MIN_Y &&
+                !blockProperties(
+                    world->getBlock(targetX, surfaceY, targetZ)
+                ).solid
+            ) {
+                --surfaceY;
+            }
+
+            if (surfaceY >= WORLD_MIN_Y) {
+                ++surfaceY;
+
+                // Suyun içinde doğmayı önle.
+                while (
+                    surfaceY <= WORLD_MAX_Y &&
+                    world->getBlock(targetX, surfaceY, targetZ) == Block::Water
+                ) {
+                    ++surfaceY;
+                }
+
+                player.position = glm::vec3(
+                    static_cast<float>(targetX),
+                    static_cast<float>(surfaceY),
+                    static_cast<float>(targetZ)
+                );
+
+                player.velocity = glm::vec3(0.0f);
+                player.onGround = false;
+                camera.position = player.eyePosition();
+
+                const int chunkX =
+                    World::floorDiv(targetX, CHUNK_SIZE);
+                const int chunkZ =
+                    World::floorDiv(targetZ, CHUNK_SIZE);
+
+                world->updateStreaming(
+                    chunkX,
+                    chunkZ,
+                    player.position.y
+                );
+            }
+        }
+
+        previousTeleportKeys[i] = pressed;
+    }
+} else {
+    // Menü kapalıyken eski tuş durumlarını sıfırla.
+    for (int i = 0; i < 4; ++i) {
+        previousTeleportKeys[i] = false;
+    }
+}
+
             if (startWorldRequested) {
                 startWorldRequested = false;
                 startWorld();
@@ -1421,6 +1601,8 @@ world->updateStreaming(playerChunkX, playerChunkZ, player.position.y);
 
             renderCrosshair(shader);
 
+
+            renderDebugMenu(shader, w, h);
 
             // =================================================
             // FRAME
