@@ -57,17 +57,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     # Copy the executable and all resolved non-system runtime libraries
     # after each successful build.
+    
     add_custom_command(TARGET VoxelCraft POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${DIST_LIB_DIR}"
         COMMAND "${CMAKE_COMMAND}" -E copy
             "$<TARGET_FILE:VoxelCraft>"
             "${DIST_DIR}/VoxelCraft"
+
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${CMAKE_SOURCE_DIR}/shaders"
+            "${DIST_DIR}/shaders"
+
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets"
+            "${DIST_DIR}/assets"
+
         COMMAND "${CMAKE_COMMAND}" -E env
             "VOXELCRAFT_BINARY=$<TARGET_FILE:VoxelCraft>"
             "VOXELCRAFT_DIST_LIB=${DIST_LIB_DIR}"
             sh -c
             "ldd \"$VOXELCRAFT_BINARY\" | awk '/=> \\/.*\\.so/ {print $3} /^[[:space:]]*\\// {print $1}' | sort -u | while read -r lib; do case \"$lib\" in /usr/lib/libc.so*|/usr/lib/libm.so*|/usr/lib/ld-linux*|/lib64/ld-linux*) continue ;; esac; [ -f \"$lib\" ] && cp -L -n \"$lib\" \"$VOXELCRAFT_DIST_LIB/\"; done"
+
         COMMAND patchelf --set-rpath "$ORIGIN/lib"
             "${DIST_DIR}/VoxelCraft"
         VERBATIM

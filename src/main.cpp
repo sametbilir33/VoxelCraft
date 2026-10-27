@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <memory>
 #include <string>
+#include <filesystem>
 
 constexpr int WIDTH = 1280;
 constexpr int HEIGHT = 720;
@@ -1202,6 +1203,18 @@ void renderBlockPreview(
 // ============================================================
 
 int main() {
+
+#ifdef __linux__
+    try {
+        std::filesystem::current_path(
+            std::filesystem::canonical("/proc/self/exe").parent_path()
+        );
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Calisma dizini ayarlanamadi: "
+                  << e.what() << '\n';
+        return 1;
+    }
+#endif
 
     if (!glfwInit())
         return -1;
